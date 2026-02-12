@@ -28,7 +28,7 @@ jobs:
           GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "downonly-linux-amd64-${VERSION}" main.go
           GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o "downonly-linux-arm64-${VERSION}" main.go
 
-      # 2. 上传二进制到 Release
+      # 2. 上传到 Release
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
@@ -36,22 +36,27 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3. 设置 Docker 编译环境
+      # 3. 设置多架构环境
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 4. 登录 GitHub 官方容器托管
-      - name: Login to GitHub Container Registry
+      # 4. 将仓库名转换为全小写
+      - name: Lowercase repo name
+        run: |
+          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      # 5. 登录镜像仓库
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5. 构建并推送 Docker 镜像
+      # 6. 构建并推送镜像
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -59,5 +64,5 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/${{ github.repository_owner }}/downonly:latest
-            ghcr.io/${{ github.repository_owner }}/downonly:${{ github.ref_name }}
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
