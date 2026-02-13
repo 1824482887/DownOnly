@@ -25,11 +25,13 @@ const dataDir = "data"
 // ==================== 数据结构 ====================
 
 type Config struct {
-	SpeedLimitMbps int      `json:"speed_limit_mbps"`
-	DailyQuotaGB   int      `json:"daily_quota_gb"`
-	ScheduleStart  string   `json:"schedule_start"`
-	ScheduleEnd    string   `json:"schedule_end"`
-	URLs           []string `json:"urls"`
+	SpeedLimitMbps  int      `json:"speed_limit_mbps"`
+	DailyQuotaGB    int      `json:"daily_quota_gb"`
+	ScheduleStart   string   `json:"schedule_start"`
+	ScheduleEnd     string   `json:"schedule_end"`
+	SleepMinMinutes int      `json:"sleep_min_minutes"`
+	SleepMaxMinutes int      `json:"sleep_max_minutes"`
+	URLs            []string `json:"urls"`
 }
 
 type Stats struct {
@@ -55,7 +57,6 @@ type App struct {
 	stats  Stats
 	logs   LogStore
 
-	// 运行时状态（仅内存）
 	isRunning       bool
 	status          string
 	speedMbps       float64
@@ -70,10 +71,12 @@ func (app *App) loadConfig() {
 	data, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
 	if err != nil {
 		app.config = Config{
-			SpeedLimitMbps: 5,
-			DailyQuotaGB:   200,
-			ScheduleStart:  "00:00",
-			ScheduleEnd:    "23:59",
+			SpeedLimitMbps:  5,
+			DailyQuotaGB:    200,
+			ScheduleStart:   "00:00",
+			ScheduleEnd:     "23:59",
+			SleepMinMinutes: 10,
+			SleepMaxMinutes: 20,
 			URLs: []string{
 				"http://updates-http.cdn-apple.com/2019WinterFCS/fullrestores/041-39257/32129B6C-292C-11E9-9E72-4511412B0A59/iPhone_4.7_12.1.4_16D57_Restore.ipsw",
 			},
@@ -82,6 +85,15 @@ func (app *App) loadConfig() {
 		return
 	}
 	json.Unmarshal(data, &app.config)
+	if app.config.SleepMinMinutes <= 0 {
+		app.config.SleepMinMinutes = 10
+	}
+	if app.config.SleepMaxMinutes <= 0 {
+		app.config.SleepMaxMinutes = 20
+	}
+	if app.config.SleepMaxMinutes < app.config.SleepMinMinutes {
+		app.config.SleepMaxMinutes = app.config.SleepMinMinutes
+	}
 }
 
 func (app *App) saveConfig() {
@@ -143,14 +155,12 @@ func (app *App) checkDateChange() {
 	if app.stats.TodayDate == today {
 		return
 	}
-	// 归档昨天的数据
 	if app.stats.TodayDate != "" && app.stats.TodayBytes > 0 {
 		app.stats.Daily[app.stats.TodayDate] = app.stats.TodayBytes
 	}
 	app.stats.TodayBytes = 0
 	app.stats.TodayDate = today
 	app.addLog("日期更新，流量计数器已重置")
-	// 年度清理：删除非今年的记录
 	thisYear := time.Now().Format("2006")
 	for k := range app.stats.Daily {
 		if !strings.HasPrefix(k, thisYear) {
@@ -176,14 +186,13 @@ func (app *App) isInSchedule() bool {
 	if start <= end {
 		return nowMin >= start && nowMin <= end
 	}
-	return nowMin >= start || nowMin <= end // 跨午夜
+	return nowMin >= start || nowMin <= end
 }
 
 func (app *App) isQuotaReached() bool {
 	return app.stats.TodayBytes >= uint64(app.config.DailyQuotaGB)*1e9
 }
 
-// 可中断的休眠：每秒检查是否需要停止
 func (app *App) sleepWithCheck(seconds int) {
 	for i := 0; i < seconds; i++ {
 		app.mu.Lock()
@@ -207,7 +216,6 @@ var userAgents = []string{
 
 func (app *App) downloadWorker() {
 	for {
-		// 1. 是否启用？
 		app.mu.Lock()
 		running := app.isRunning
 		app.mu.Unlock()
@@ -216,7 +224,6 @@ func (app *App) downloadWorker() {
 			continue
 		}
 
-		// 2. 是否在时间窗口内？
 		app.mu.Lock()
 		if !app.isInSchedule() {
 			app.status = "out_of_schedule"
@@ -224,19 +231,17 @@ func (app *App) downloadWorker() {
 			app.sleepWithCheck(30)
 			continue
 		}
-
-		// 3. 是否超出配额？
 		if app.isQuotaReached() {
 			app.status = "quota_reached"
 			app.mu.Unlock()
 			app.sleepWithCheck(60)
 			continue
 		}
-
-		// 4. 取配置快照
 		urls := make([]string, len(app.config.URLs))
 		copy(urls, app.config.URLs)
 		speedLimit := app.config.SpeedLimitMbps
+		sleepMin := app.config.SleepMinMinutes
+		sleepMax := app.config.SleepMaxMinutes
 		app.mu.Unlock()
 
 		if len(urls) == 0 {
@@ -248,7 +253,6 @@ func (app *App) downloadWorker() {
 			continue
 		}
 
-		// 5. 随机选一个地址开始下载
 		url := urls[rand.Intn(len(urls))]
 
 		app.mu.Lock()
@@ -271,11 +275,19 @@ func (app *App) downloadWorker() {
 			continue
 		}
 
-		// 6. 随机休息 10~20 分钟
-		sleepSec := rand.Intn(600) + 600
+		// 根据配置的休息区间随机休息
+		if sleepMax < sleepMin {
+			sleepMax = sleepMin
+		}
+		sleepMinSec := sleepMin * 60
+		sleepMaxSec := sleepMax * 60
+		sleepSec := sleepMinSec
+		if sleepMaxSec > sleepMinSec {
+			sleepSec = rand.Intn(sleepMaxSec-sleepMinSec) + sleepMinSec
+		}
 		app.mu.Lock()
 		app.status = "sleeping"
-		app.addLog(fmt.Sprintf("休息 %d 秒", sleepSec))
+		app.addLog(fmt.Sprintf("休息 %d 分 %d 秒", sleepSec/60, sleepSec%60))
 		app.mu.Unlock()
 
 		app.sleepWithCheck(sleepSec)
@@ -301,15 +313,13 @@ func (app *App) doDownload(url string, speedLimitMbps int) (uint64, error) {
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	// Mbps → Bytes/s : 5 Mbps = 5*1000000/8 = 625000 B/s
 	bytesPerSec := int64(speedLimitMbps) * 1000000 / 8
-	buf := make([]byte, 32*1024) // 32KB 缓冲区，对 512MB 内存友好
+	buf := make([]byte, 32*1024)
 	var total uint64
 	var windowBytes int64
 	windowStart := time.Now()
 
 	for {
-		// 检查是否应该停止
 		app.mu.Lock()
 		running := app.isRunning
 		quota := app.isQuotaReached()
@@ -328,20 +338,16 @@ func (app *App) doDownload(url string, speedLimitMbps int) (uint64, error) {
 			app.bytesThisSecond += uint64(n)
 			app.mu.Unlock()
 
-			// 精准限速：计算当前窗口应该花费的时间
 			elapsed := time.Since(windowStart)
 			expected := time.Duration(float64(windowBytes) / float64(bytesPerSec) * float64(time.Second))
 			if expected > elapsed {
 				time.Sleep(expected - elapsed)
 			}
-
-			// 每秒重置窗口
 			if time.Since(windowStart) >= time.Second {
 				windowBytes = 0
 				windowStart = time.Now()
 			}
 		}
-
 		if readErr != nil {
 			if readErr == io.EOF {
 				return total, nil
@@ -353,21 +359,17 @@ func (app *App) doDownload(url string, speedLimitMbps int) (uint64, error) {
 
 // ==================== 后台协程 ====================
 
-// 每秒更新速度和折线图数据
 func (app *App) speedTracker() {
 	for range time.NewTicker(time.Second).C {
 		app.mu.Lock()
 		app.checkDateChange()
-
 		bytes := app.bytesThisSecond
 		app.bytesThisSecond = 0
-
 		mbps := float64(bytes) * 8 / 1e6
 		if !app.isRunning {
 			mbps = 0
 		}
 		app.speedMbps = mbps
-
 		app.speedHistory = append(app.speedHistory, mbps)
 		if len(app.speedHistory) > 30 {
 			app.speedHistory = app.speedHistory[len(app.speedHistory)-30:]
@@ -376,7 +378,6 @@ func (app *App) speedTracker() {
 	}
 }
 
-// 每 60 秒自动保存数据到磁盘
 func (app *App) autoSaver() {
 	for range time.NewTicker(60 * time.Second).C {
 		app.mu.Lock()
@@ -391,12 +392,10 @@ func (app *App) autoSaver() {
 func (app *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	app.mu.Lock()
 	defer app.mu.Unlock()
-
 	var uptime int64
 	if app.isRunning {
 		uptime = int64(time.Since(app.startedAt).Seconds())
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":         app.status,
@@ -416,7 +415,6 @@ func (app *App) handleToggle(w http.ResponseWriter, r *http.Request) {
 	}
 	app.mu.Lock()
 	defer app.mu.Unlock()
-
 	app.isRunning = !app.isRunning
 	if app.isRunning {
 		app.status = "running"
@@ -436,16 +434,12 @@ func (app *App) handleHistory(w http.ResponseWriter, r *http.Request) {
 	if err != nil || month < 1 || month > 12 {
 		month = int(time.Now().Month())
 	}
-
 	app.mu.Lock()
 	defer app.mu.Unlock()
-
 	year := time.Now().Year()
 	lastDay := time.Date(year, time.Month(month)+1, 0, 0, 0, 0, 0, time.Local).Day()
-
 	var totalBytes uint64
 	days := make([]map[string]interface{}, 0, lastDay)
-
 	for d := 1; d <= lastDay; d++ {
 		dateStr := fmt.Sprintf("%04d-%02d-%02d", year, month, d)
 		var b uint64
@@ -457,7 +451,6 @@ func (app *App) handleHistory(w http.ResponseWriter, r *http.Request) {
 		totalBytes += b
 		days = append(days, map[string]interface{}{"day": d, "bytes": b})
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"month":             month,
@@ -480,11 +473,21 @@ func (app *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "", 400)
 			return
 		}
+		if cfg.SleepMinMinutes <= 0 {
+			cfg.SleepMinMinutes = 10
+		}
+		if cfg.SleepMaxMinutes <= 0 {
+			cfg.SleepMaxMinutes = 20
+		}
+		if cfg.SleepMaxMinutes < cfg.SleepMinMinutes {
+			cfg.SleepMaxMinutes = cfg.SleepMinMinutes
+		}
 		app.mu.Lock()
 		app.config = cfg
 		app.saveConfig()
-		app.addLog(fmt.Sprintf("配置已更新: %d Mbps, %d GB/天, %s - %s",
-			cfg.SpeedLimitMbps, cfg.DailyQuotaGB, cfg.ScheduleStart, cfg.ScheduleEnd))
+		app.addLog(fmt.Sprintf("配置已更新: %d Mbps, %d GB/天, %s-%s, 休息 %d~%d 分钟",
+			cfg.SpeedLimitMbps, cfg.DailyQuotaGB, cfg.ScheduleStart, cfg.ScheduleEnd,
+			cfg.SleepMinMinutes, cfg.SleepMaxMinutes))
 		app.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
@@ -528,19 +531,16 @@ func main() {
 		speedHistory: make([]float64, 30),
 	}
 
-	// 加载持久化数据
 	app.loadConfig()
 	app.loadStats()
 	app.loadLogs()
 	app.addLog("DownOnly 初始化完成")
 	app.saveLogs()
 
-	// 启动后台协程
 	go app.downloadWorker()
 	go app.speedTracker()
 	go app.autoSaver()
 
-	// 路由注册
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -555,7 +555,6 @@ func main() {
 	http.HandleFunc("/api/logs", app.handleLogs)
 	http.HandleFunc("/api/config", app.handleConfig)
 
-	// 优雅退出：Ctrl+C 时保存数据
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
@@ -569,7 +568,6 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// 启动 HTTP 服务
 	port := "8080"
 	if len(os.Args) > 1 {
 		port = os.Args[1]
