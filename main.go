@@ -541,6 +541,16 @@ func main() {
 	go app.speedTracker()
 	go app.autoSaver()
 
+	// ==================== 新增代码开始 ====================
+	// 自动启动服务，不用手动点按钮
+	app.mu.Lock()         // 加锁保证线程安全
+	app.isRunning = true  // 强制设为运行状态
+	app.status = "running"// 状态改为运行中
+	app.startedAt = time.Now() // 记录启动时间
+	app.addLog("服务已自动启动") // 日志记录
+	app.mu.Unlock()       // 解锁
+	// ==================== 新增代码结束 ====================
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
